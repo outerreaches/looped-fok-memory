@@ -33,6 +33,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .client import EXTRACTOR_SYS, PF_MM, UNIFIED_TOKENS, pack_ctrl
+from .sqlite_store import SQLiteMemoryStore
 from .store import CATEGORY_LIST, GeneralMemoryStore, MemoryItem, ScopePolicyFilter
 
 LOG = logging.getLogger("looped_fok.proxy")
@@ -179,12 +180,32 @@ class FOKProxyState:
         store_path: str | Path,
         alpha: float = 0.35,
         reader: str = "mlp",
+        top_k: int = 8,
+        write_top_k: int = 12,
     ) -> None:
         self.upstream_url = upstream_url.rstrip("/")
         self.upstream_model = upstream_model
         self.public_model = public_model
         self.store_path = Path(store_path)
-        self.store = GeneralMemoryStore(policy=ScopePolicyFilter(), persist_path=self.store_path)
+        self.top_k = top_k
+        self.write_top_k = write_top_k
+
+        if self.store_path.suffix.lower() in (".db", ".sqlite", ".sqlite3"):
+            self.store = SQLiteMemoryStore(self.store_path, policy=ScopePolicyFilter(), default_top_k=top_k)
+            legacy_json = self.store_path.with_suffix(".json")
+            if legacy_json.exists():
+                n_mig = self.store.migrate_from_json(legacy_json)
+                if n_mig:
+                    LOG.info("Migrated %d memories from %s -> %s", n_mig, legacy_json, self.store_path)
+            max_num = self.store.max_numeric_id()
+        else:
+            self.store = GeneralMemoryStore(policy=ScopePolicyFilter(), persist_path=self.store_path)
+            max_num = 0
+            for it in self.store._items.values():
+                m = re.match(r"m_(\d+)$", it.item_id)
+                if m:
+                    max_num = max(max_num, int(m.group(1)))
+
         is_lin = 1 if reader == "lin" else 0
         self.ctrl_rw = pack_ctrl(alpha, vec_id=1, gate_mode=1, scope=9, reader_slot=0, is_lin=is_lin)
         self.ctrl_write_only = pack_ctrl(0.0, vec_id=1, gate_mode=7, scope=9, reader_slot=0, is_lin=is_lin)
@@ -194,12 +215,6 @@ class FOKProxyState:
         self._pending_writes = 0
         self._write_threads: list[threading.Thread] = []
         self._id_lock = threading.Lock()
-        # Resume monotonic ID counter above any loaded IDs
-        max_num = 0
-        for it in self.store._items.values():
-            m = re.match(r"m_(\d+)$", it.item_id)
-            if m:
-                max_num = max(max_num, int(m.group(1)))
         self._next_id = max_num + 1
 
     def begin_pending_write(self) -> None:
@@ -254,7 +269,10 @@ class FOKProxyState:
     def run_write_extractor(self, write_context: str, ctx: dict, write_meta: dict) -> None:
         with self.write_lock:
             t0 = time.perf_counter()
-            active_dump = self.store.dump_all_active(ctx)
+            if hasattr(self.store, "query_for_write"):
+                active_dump = self.store.query_for_write(write_context, ctx, top_k=self.write_top_k)
+            else:
+                active_dump = self.store.dump_all_active(ctx)
             prompt = (
                 f"Currently active memories:\n{json.dumps(active_dump, indent=2)}\n\n"
                 f"{write_context}\n\n"
@@ -352,11 +370,13 @@ def make_handler(state: FOKProxyState):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path in ("/health", "/v1/health", "/readyz"):
+                n_act = state.store.count_active() if hasattr(state.store, "count_active") else len(state.store.all_active_unfiltered())
                 self._send_json(200, {
                     "status": "ok",
                     "public_model": state.public_model,
                     "upstream_model": state.upstream_model,
-                    "active_memories": len(state.store.all_active_unfiltered()),
+                    "backend": type(state.store).__name__,
+                    "active_memories": n_act,
                     "pending_writes": state._pending_writes,
                     "store_path": str(state.store_path),
                 })
@@ -758,13 +778,15 @@ def main() -> None:
     ap.add_argument("--upstream", default="http://127.0.0.1:8189")
     ap.add_argument("--model", default="inkling-stage-e", help="Upstream Loom model id")
     ap.add_argument("--public-model", default="inkling-fok-memory", help="Public OpenAI model id")
-    ap.add_argument("--store", default=str(Path.home() / ".local/share/looped-fok/memories.json"))
+    ap.add_argument("--store", default=str(Path.home() / ".local/share/looped-fok/memories.db"))
+    ap.add_argument("--top-k", type=int, default=8, help="Max memories surfaced per Read-FOK turn (SQLite backend)")
+    ap.add_argument("--write-top-k", type=int, default=12, help="Max candidate memories shown to Write-FOK extractor")
     ap.add_argument("--reader", choices=["mlp", "lin"], default="mlp")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s [%(levelname)s] %(message)s")
-    state = FOKProxyState(args.upstream, args.model, args.public_model, args.store, reader=args.reader)
+    state = FOKProxyState(args.upstream, args.model, args.public_model, args.store, reader=args.reader, top_k=args.top_k, write_top_k=args.write_top_k)
     srv = ThreadingHTTPServer((args.host, args.port), make_handler(state))
 
     def _graceful_stop(signum, _frame) -> None:

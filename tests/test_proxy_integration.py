@@ -201,6 +201,8 @@ class TestProxyIntegration(unittest.TestCase):
         # Verify replay enabled Stage E adapter (magic=0x7)
         replay_ctrl = self.mock.requests[1]["fok_ctrl"] & 0xFFFFFFFF
         self.assertEqual((replay_ctrl >> 28) & 0xF, 0x7)
+        # Wait for handler thread post-[DONE] inline commit before inspecting internal store directly
+        self.state.wait_for_pending_writes()
         # Verify memory committed inline and visible in repo:alpha, NOT in repo:beta
         self.assertEqual(len(self.state.store.active_items({"tenant_id": "default", "allowed_scopes": ["repo:alpha"]})), 1)
         self.assertEqual(len(self.state.store.active_items({"tenant_id": "default", "allowed_scopes": ["repo:beta"]})), 0)

@@ -8,6 +8,7 @@ from .store import (
     PolicyFilter,
     ScopePolicyFilter,
 )
+from .sqlite_store import SQLiteMemoryStore
 from .client import (
     UNIFIED_TOKENS,
     UnifiedFOKClient,
@@ -19,6 +20,7 @@ __all__ = [
     "CATEGORY_TOKENS",
     "UNIFIED_TOKENS",
     "GeneralMemoryStore",
+    "SQLiteMemoryStore",
     "MemoryItem",
     "PolicyFilter",
     "ScopePolicyFilter",

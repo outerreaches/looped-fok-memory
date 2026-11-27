@@ -22,7 +22,7 @@
    - `(0, 1)` **`200016`** → Memory-active replay + background `add` commit (works even when the store is empty via Write-Only `gate_mode = 7`).
    - `(1, 1)` **`200017..200021`** → Category-routed dereference + background `update`/`delete` commit in one signal token.
 4. **FOK-Gated Post-Coda SwiGLU Adapter (`14.15 MB` GGUF, `magic = 0x7`):** Applied on-GPU to `result_norm` right before `lm_head` **only on Memory-Active replays** (`Val CE: 2.9453 → 0.8313`, `Teacher Top-1: 81.34% → 91.60%`, `Val KL = 0.3523`, `||Δh||/||h|| = 4.33%`). Produces natural, disclaimer-free write/update/read responses while keeping `(0, 0)` turns `100%` silent bit-exact.
-5. **OpenAI-Compatible Proxy (`looped_fok.proxy`):** Tested end-to-end with **`dsh` (DeepSeek Harness)** (`examples/fok-dsh.patch.yml`); supports automatic `role == "tool"` passthrough, atomic batch JSON disk persistence, and an explicit pending-write ordering barrier so an immediate follow-up recall always sees the prior turn's committed write.
+5. **OpenAI-Compatible Proxy (`looped_fok.proxy`) + Production SQLite+FTS5 Backend (`SQLiteMemoryStore`):** Tested end-to-end with **`dsh` (DeepSeek Harness)** (`examples/fok-dsh.patch.yml`); supports automatic `role == "tool"` passthrough, WAL-mode SQLite + FTS5 BM25 bounded top-k retrieval (`0.94 ms` read top-8 / `0.72 ms` write top-12 across `10,000` active memories), ACID batch commits, and an explicit pending-write ordering barrier so an immediate follow-up recall always sees the prior turn's committed write.
 
 ---
 
@@ -52,8 +52,7 @@
 | **Multi-Repo Isolation** (`ScopePolicyFilter`: `other-repo` vs `sentinel-telemetry`) | **`2/2` (`100%`)** |
 
 ### Known Limitations & Scaling Scope
-- **Small-store benchmark scope:** Benchmarks above validate **selective whether-to-read / whether-to-write gating** on small active stores (`3–4` memories). `GeneralMemoryStore.query_by_category()` couples `project_state ↔ fact_constraint` and falls back to all active candidates if no category/tag matches; scaling to hundreds of memories will benefit from a bounded top-k reranker.
-- **In-memory vs disk complexity:** Dictionary mutations (`add`/`update`/`delete`) are `O(1)` in memory, while JSON persistence atomically rewrites the store file once per batch.
+- **Storage scaling (`SQLiteMemoryStore` vs `GeneralMemoryStore`):** Use `SQLiteMemoryStore` (`--store memories.db`, default in `v0.2.0`) for production scale — stdlib SQLite WAL + FTS5 BM25 delivers **`O(log N)` incremental ACID writes** and **bounded `O(k)` top-k retrieval** (`0.94 ms` read top-8, `0.72 ms` write top-12 at `10,000` active memories in `tests/test_sqlite_scale.py`, auto-migrating legacy `memories.json`). The lightweight in-memory `GeneralMemoryStore` (`.json`) remains available for small-store prototyping.
 - **Long harness system-prompt Read-FOK sensitivity:** Under `dsh`'s ~3.5K-token agent system prompt, a synthetic project named `zephyr-mesh` collided with the real-world Zephyr RTOS so Read-FOK stayed conservative (future improvement: include `dsh`-length system prompts in Read-FOK training).
 - **Direct client vs proxy extraction:** `looped_fok.proxy` runs background extraction with a pending-write ordering barrier; direct `UnifiedFOKClient.chat_turn()` runs extraction synchronously.
 - **Harness coverage:** End-to-end live integration has been verified with **`dsh`** (both `dsh headless` and `dsh web`); other OpenAI-compatible harnesses follow the same standard API but are untested.
@@ -82,7 +81,8 @@ python3 -m looped_fok.proxy \
   --upstream http://127.0.0.1:8189 \
   --model inkling-stage-e \
   --public-model inkling-fok-memory \
-  --store ~/.local/share/looped-fok/memories.json
+  --store ~/.local/share/looped-fok/memories.db \
+  --top-k 8 --write-top-k 12
 ```
 
 Use [`examples/fok-dsh.patch.yml`](examples/fok-dsh.patch.yml) with `dsh`:
