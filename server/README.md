@@ -10,7 +10,7 @@ This repository ships the **Python memory store, policy filter, client, and Open
 |---|---:|---|---|
 | **Base model:** `unsloth/Inkling-2-Mini` (`loom-fun__unsloth-Inkling-2-Mini-loom-b5e33e1`, `Inkling-2-Mini-UD-Q4_K_XL.gguf`) | base | *(upstream Loom package)* | Frozen 3-pass looped MoE backbone |
 | **Runtime:** Loom `0.3.0` (`loom-serve`) | binary | *(upstream Loom 0.3.0)* | GPU inference runtime (tested on AMD Radeon 8060S `gfx1151`) |
-| **Sidecar 1:** `fok_bank_coding.gguf` | `5.84 MB` | `d991de6fe9b8e2d6f761828ab0f1c6f5e53e29c90e2155497d95a0228f12aadd` | 9-tensor F32 GGUF: Pass-0 Read/Write/Category probes, `v_oracle`, System-2 Coda MLP64 |
+| **Sidecar 1:** `fok_bank_coding.gguf` | `5.84 MB` | `47e533de885b040b02947a2aded0686934e0108b980cfe8b1dcaaeac58de0a99` | 9-tensor F32 GGUF: Pass-0 Read/Write/Category probes (`L0+L1+L2_DSH` 3.3K-tok trained), `v_oracle`, System-2 Coda MLP64 |
 | **Sidecar 2:** `fok_coda_adapter.gguf` | `14.16 MB` | `e7841bdb313b89ee3f8ab74ddf2ebca650f2777583644b635b068079cb96430e` | 3-tensor F32 GGUF: Stage E.2 KL-regularized Post-Coda SwiGLU Residual Adapter (`hidden=512`, `magic=0x7`) |
 
 *(Total sidecar download: **`19.95 MB`**.)*
