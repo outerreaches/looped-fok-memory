@@ -127,6 +127,7 @@ class TestUnifiedProtocol(unittest.TestCase):
                     {"role": "user", "content": "Current runtime context. Policy: workspace-write."},
                 ],
                 "max_completion_tokens": 512,
+                "stream_options": {"include_usage": True},
             },
             upstream_model="inkling-stage-e",
         )
@@ -134,6 +135,7 @@ class TestUnifiedProtocol(unittest.TestCase):
         self.assertEqual([m["role"] for m in norm["messages"]], ["system", "system", "user"])
         self.assertEqual(norm["messages"][-1]["content"], "Remember Go 1.23.")
         self.assertEqual(norm["max_tokens"], 512)
+        self.assertEqual(norm["stream_options"], {"include_usage": True})
 
         # Resilient JSON op parser recovers valid object even if another object is malformed
         raw = '[{"op":"add","key":"a","value":"ok"},{"op":"add","key":"b","value":"broken "quote""}]'

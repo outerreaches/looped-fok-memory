@@ -91,7 +91,7 @@ def normalize_loom_payload(req_body: dict, upstream_model: str) -> tuple[dict, b
         norm_msgs.insert(len(norm_msgs) - 1, rt_ctx)
 
     out: dict = {"model": upstream_model, "messages": norm_msgs, "stream": True}
-    for k in ("temperature", "top_p", "max_tokens", "reasoning_effort", "tools", "tool_choice", "stop"):
+    for k in ("temperature", "top_p", "max_tokens", "reasoning_effort", "tools", "tool_choice", "stop", "stream_options"):
         if k in req_body and req_body[k] is not None:
             out[k] = req_body[k]
     if "max_tokens" not in out and req_body.get("max_completion_tokens") is not None:
