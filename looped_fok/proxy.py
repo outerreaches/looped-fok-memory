@@ -54,7 +54,12 @@ def extract_user_text(msg: dict) -> str:
     return str(content)
 
 
-def normalize_loom_payload(req_body: dict, upstream_model: str) -> tuple[dict, bool]:
+def normalize_loom_payload(
+    req_body: dict,
+    upstream_model: str,
+    default_temperature: float | None = None,
+    default_top_p: float | None = None,
+) -> tuple[dict, bool]:
     """Normalize OpenAI/dsh request payloads for Loom 0.3.0 (developer->system, list content->str).
 
     Returns (normalized_payload, is_aux_title_call).
@@ -96,6 +101,10 @@ def normalize_loom_payload(req_body: dict, upstream_model: str) -> tuple[dict, b
             out[k] = req_body[k]
     if "max_tokens" not in out and req_body.get("max_completion_tokens") is not None:
         out["max_tokens"] = req_body["max_completion_tokens"]
+    if "temperature" not in out and default_temperature is not None:
+        out["temperature"] = default_temperature
+    if "top_p" not in out and default_top_p is not None:
+        out["top_p"] = default_top_p
 
     # Detect harness auxiliary metadata calls (e.g. dsh session-title-llm: max_tokens <= 64 + title prompt)
     max_tok = out.get("max_tokens")
@@ -182,6 +191,8 @@ class FOKProxyState:
         reader: str = "mlp",
         top_k: int = 8,
         write_top_k: int = 12,
+        default_temperature: float | None = None,
+        default_top_p: float | None = None,
     ) -> None:
         self.upstream_url = upstream_url.rstrip("/")
         self.upstream_model = upstream_model
@@ -189,6 +200,8 @@ class FOKProxyState:
         self.store_path = Path(store_path)
         self.top_k = top_k
         self.write_top_k = write_top_k
+        self.default_temperature = default_temperature
+        self.default_top_p = default_top_p
 
         if self.store_path.suffix.lower() in (".db", ".sqlite", ".sqlite3"):
             self.store = SQLiteMemoryStore(self.store_path, policy=ScopePolicyFilter(), default_top_k=top_k)
@@ -264,7 +277,7 @@ class FOKProxyState:
             headers={"Content-Type": "application/json", "Accept": "text/event-stream" if payload.get("stream") else "application/json"},
             method="POST",
         )
-        return urllib.request.urlopen(req, timeout=300.0)
+        return urllib.request.urlopen(req, timeout=1800.0)
 
     def run_write_extractor(self, write_context: str, ctx: dict, write_meta: dict) -> None:
         with self.write_lock:
@@ -545,13 +558,13 @@ def make_handler(state: FOKProxyState):
             messages = req_body.get("messages") or []
             ctx, write_meta = self._ctx_from_headers()
 
-            # Guarantee previous-write -> next-read ordering before checking active memories!
-            state.wait_for_pending_writes()
-            with state.write_lock:
-                has_mem = state.store.has_active_memories(ctx)
-
             # Normalize OpenAI/dsh fields for Loom 0.3.0 (developer->system, list content->str)
-            base_payload, is_aux = normalize_loom_payload(req_body, state.upstream_model)
+            base_payload, is_aux = normalize_loom_payload(
+                req_body,
+                state.upstream_model,
+                default_temperature=state.default_temperature,
+                default_top_p=state.default_top_p,
+            )
             norm_msgs = base_payload["messages"]
 
             # Agentic Loop Guard: only fresh user turns (non-auxiliary) engage Read+Write FOK!
@@ -571,6 +584,12 @@ def make_handler(state: FOKProxyState):
                     LOG.error("Upstream passthrough %d: %s", e.code, err_body[:400])
                     self._send_json(e.code, {"error": err_body})
                 return
+
+            # Guarantee previous-write -> next-read ordering before checking active memories
+            # (placed after passthrough guard so tool-result turns never stall on async Write-FOK).
+            state.wait_for_pending_writes()
+            with state.write_lock:
+                has_mem = state.store.has_active_memories(ctx)
 
             # Stage D.2 Single-Pass Unified On-GPU Read+Write Probe
             probe_payload = dict(base_payload)
@@ -781,12 +800,24 @@ def main() -> None:
     ap.add_argument("--store", default=str(Path.home() / ".local/share/looped-fok/memories.db"))
     ap.add_argument("--top-k", type=int, default=8, help="Max memories surfaced per Read-FOK turn (SQLite backend)")
     ap.add_argument("--write-top-k", type=int, default=12, help="Max candidate memories shown to Write-FOK extractor")
+    ap.add_argument("--default-temperature", type=float, default=None, help="Fallback temperature when client omits it")
+    ap.add_argument("--default-top-p", type=float, default=None, help="Fallback top_p when client omits it")
     ap.add_argument("--reader", choices=["mlp", "lin"], default="mlp")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s [%(levelname)s] %(message)s")
-    state = FOKProxyState(args.upstream, args.model, args.public_model, args.store, reader=args.reader, top_k=args.top_k, write_top_k=args.write_top_k)
+    state = FOKProxyState(
+        args.upstream,
+        args.model,
+        args.public_model,
+        args.store,
+        reader=args.reader,
+        top_k=args.top_k,
+        write_top_k=args.write_top_k,
+        default_temperature=args.default_temperature,
+        default_top_p=args.default_top_p,
+    )
     srv = ThreadingHTTPServer((args.host, args.port), make_handler(state))
 
     def _graceful_stop(signum, _frame) -> None:

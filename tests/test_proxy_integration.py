@@ -258,6 +258,25 @@ class TestProxyIntegration(unittest.TestCase):
         self.assertEqual(items[0].value, "ClickHouse")
         self.assertEqual(items[0].version, 2)
 
+    def test_default_sampling_fallback_and_client_override(self) -> None:
+        from looped_fok.proxy import normalize_loom_payload
+        p_omitted, _ = normalize_loom_payload(
+            {"messages": [{"role": "user", "content": "hi"}]},
+            "inkling-stage-e",
+            default_temperature=1.0,
+            default_top_p=1.0,
+        )
+        self.assertEqual(p_omitted["temperature"], 1.0)
+        self.assertEqual(p_omitted["top_p"], 1.0)
+        p_explicit, _ = normalize_loom_payload(
+            {"messages": [{"role": "user", "content": "hi"}], "temperature": 0.0, "top_p": 0.9},
+            "inkling-stage-e",
+            default_temperature=1.0,
+            default_top_p=1.0,
+        )
+        self.assertEqual(p_explicit["temperature"], 0.0)
+        self.assertEqual(p_explicit["top_p"], 0.9)
+
 
 if __name__ == "__main__":
     unittest.main()
