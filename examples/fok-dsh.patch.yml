@@ -1,0 +1,37 @@
+# Non-invasive dsh patch overlay for Looped FOK Memory (http://127.0.0.1:8190/v1)
+# Usage: dsh --profile headless --patch ./fok-dsh.patch.yml "your coding task"
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      fok-memory:
+        displayName: Looped FOK Memory (Beelink)
+        api: openai-completions
+        baseURL: http://127.0.0.1:8190/v1
+        timeoutMs: 600000
+        streamIdleTimeoutMs: 600000
+        headers:
+          Authorization: Bearer local
+          X-FOK-Scope: repo:dsh-testdrive
+        models:
+          - id: inkling-fok-memory
+            name: Inkling 2 Mini + Unified On-GPU Read+Write FOK
+            description: Single-model Inkling 2 Mini with zero-overhead on-GPU Read+Write FOK memory sidecar (Beelink :8190 -> :8189).
+            contextWindow: 65536
+            maxTokens: 8192
+            reasoningEfforts:
+              "off": none
+              minimal: low
+              low: low
+              medium: medium
+              high: high
+              xhigh: high
+              max: high
+            input:
+              - text
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: fok-memory
+    model: inkling-fok-memory
+    reasoningEffort: low
