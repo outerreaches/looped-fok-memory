@@ -51,6 +51,10 @@
 | **Silent Bit-Identity** (7 ephemeral/negative turns vs `base`) | **`7/7` (`100%`)** |
 | **Multi-Repo Isolation** (`ScopePolicyFilter`: `other-repo` vs `sentinel-telemetry`) | **`2/2` (`100%`)** |
 
+### 3. Production Scale & Cross-Session `dsh` Reasoning (`v0.2.0`, `SQLiteMemoryStore`)
+- **10,000-Memory Scale Benchmark (`tests/test_sqlite_scale.py`):** `10,003` active memories across 10 repos — **`1.03 ms`** bounded `read_top8` (`n_surfaced <= 8`) and **`0.73 ms`** bounded `write_top12` via stdlib SQLite WAL + FTS5 BM25.
+- **6-Session Cross-Process `dsh headless` Reasoning (`meridian-ingest`):** Across 6 independent `dsh` invocations (zero shared harness history), the model learned runtime/security/schedule constraints (`S1`), stayed silent on an ephemeral security Q&A (`S2`), caught all 3 hidden violations in a teammate's PR (`GPLv3` crate, `/tmp` write on read-only rootfs, logging `X-API-Key`, `S3`), synthesized 4 separate constraints to reject a `400 MB` in-RAM GeoIP load + Friday freeze deploy (`S4`), atomically updated RAM (`256 MiB → 1 GiB`) and tombstoned the freeze (`S5`), and re-reasoned with the updated `~600 MB` headroom and zero stale ghosting (`S6`).
+
 ### Known Limitations & Scaling Scope
 - **Storage scaling (`SQLiteMemoryStore` vs `GeneralMemoryStore`):** Use `SQLiteMemoryStore` (`--store memories.db`, default in `v0.2.0`) for production scale — stdlib SQLite WAL + FTS5 BM25 delivers **`O(log N)` incremental ACID writes** and **bounded `O(k)` top-k retrieval** (`0.94 ms` read top-8, `0.72 ms` write top-12 at `10,000` active memories in `tests/test_sqlite_scale.py`, auto-migrating legacy `memories.json`). The lightweight in-memory `GeneralMemoryStore` (`.json`) remains available for small-store prototyping.
 - **Long harness system-prompt Read-FOK sensitivity:** Under `dsh`'s ~3.5K-token agent system prompt, a synthetic project named `zephyr-mesh` collided with the real-world Zephyr RTOS so Read-FOK stayed conservative (future improvement: include `dsh`-length system prompts in Read-FOK training).
