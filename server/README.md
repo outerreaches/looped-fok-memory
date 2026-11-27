@@ -13,7 +13,18 @@ This repository ships the **Python memory store, policy filter, client, and Open
 | **Sidecar 1:** `fok_bank_coding.gguf` | `5.84 MB` | `d991de6fe9b8e2d6f761828ab0f1c6f5e53e29c90e2155497d95a0228f12aadd` | 9-tensor F32 GGUF: Pass-0 Read/Write/Category probes, `v_oracle`, System-2 Coda MLP64 |
 | **Sidecar 2:** `fok_coda_adapter.gguf` | `14.16 MB` | `e7841bdb313b89ee3f8ab74ddf2ebca650f2777583644b635b068079cb96430e` | 3-tensor F32 GGUF: Stage E.2 KL-regularized Post-Coda SwiGLU Residual Adapter (`hidden=512`, `magic=0x7`) |
 
-*(Total sidecar download: **`19.95 MB`**, uploaded as GitHub Release assets alongside the Stage E `llm.loom` / `deploy_stage_e.json` patch.)*
+*(Total sidecar download: **`19.95 MB`**.)*
+
+### Download Sidecars
+
+- **Hugging Face (primary):** [`outerreaches/inkling-2-mini-looped-fok-sidecars`](https://huggingface.co/outerreaches/inkling-2-mini-looped-fok-sidecars)
+  ```bash
+  hf download outerreaches/inkling-2-mini-looped-fok-sidecars \
+    fok_bank_coding.gguf fok_coda_adapter.gguf SHA256SUMS.txt \
+    --local-dir ./fok-sidecars
+  sha256sum -c ./fok-sidecars/SHA256SUMS.txt
+  ```
+- **GitHub Releases (mirror):** Attached to [`v0.1.0`](https://github.com/outerreaches/looped-fok-memory/releases) (`fok_bank_coding.gguf`, `fok_coda_adapter.gguf`, `SHA256SUMS.txt`).
 
 ---
 
