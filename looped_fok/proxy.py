@@ -23,6 +23,7 @@ import argparse
 import json
 import logging
 import re
+import signal
 import threading
 import time
 import urllib.error
@@ -189,6 +190,9 @@ class FOKProxyState:
         self.ctrl_write_only = pack_ctrl(0.0, vec_id=1, gate_mode=7, scope=9, reader_slot=0, is_lin=is_lin)
         self.ctrl_adapter = pack_adapter_ctrl(1.0)
         self.write_lock = threading.Lock()
+        self._pending_cond = threading.Condition()
+        self._pending_writes = 0
+        self._write_threads: list[threading.Thread] = []
         self._id_lock = threading.Lock()
         # Resume monotonic ID counter above any loaded IDs
         max_num = 0
@@ -197,6 +201,39 @@ class FOKProxyState:
             if m:
                 max_num = max(max_num, int(m.group(1)))
         self._next_id = max_num + 1
+
+    def begin_pending_write(self) -> None:
+        with self._pending_cond:
+            self._pending_writes += 1
+
+    def end_pending_write(self) -> None:
+        with self._pending_cond:
+            self._pending_writes = max(0, self._pending_writes - 1)
+            if self._pending_writes == 0:
+                self._pending_cond.notify_all()
+
+    def wait_for_pending_writes(self, timeout: float = 60.0) -> bool:
+        with self._pending_cond:
+            return self._pending_cond.wait_for(lambda: self._pending_writes == 0, timeout=timeout)
+
+    def drain_pending_writes(self, timeout: float = 60.0) -> None:
+        self.wait_for_pending_writes(timeout=timeout)
+        for th in list(self._write_threads):
+            if th.is_alive():
+                th.join(timeout=timeout)
+        self._write_threads = [th for th in self._write_threads if th.is_alive()]
+
+    def start_background_extractor(self, write_ctx: str, ctx: dict, write_meta: dict) -> None:
+        """Spawn a non-daemon extractor thread; caller MUST have already called begin_pending_write()."""
+        def _worker() -> None:
+            try:
+                self.run_write_extractor(write_ctx, ctx, write_meta)
+            finally:
+                self.end_pending_write()
+
+        th = threading.Thread(target=_worker, daemon=False)
+        self._write_threads = [t for t in self._write_threads if t.is_alive()] + [th]
+        th.start()
 
     def next_mem_id(self) -> str:
         with self._id_lock:
@@ -250,41 +287,42 @@ class FOKProxyState:
             self.commit_ops(ops, ctx, write_meta, source="extractor", elapsed_ms=(time.perf_counter() - t0) * 1000)
 
     def commit_ops(self, ops: list[dict], ctx: dict, write_meta: dict, source: str = "inline", elapsed_ms: float = 0.0) -> list[str]:
-        """Commit parsed memory operations atomically under `write_lock` (called inline or from fallback extractor)."""
+        """Commit parsed memory operations as one atomic batch (caller holds `write_lock`)."""
         applied: list[str] = []
         active_ids = {it.item_id for it in self.store.active_items(ctx)}
-        for op in ops:
-            if not isinstance(op, dict):
-                continue
-            kind = str(op.get("op", "")).lower().strip()
-            cat = str(op.get("category", "project_state")).strip()
-            if cat not in CATEGORY_LIST:
-                cat = "project_state"
-            key = str(op.get("key") or "").strip()
-            val = str(op.get("value") or op.get("content") or "").strip()
-            if not key and val:
-                words = [w for w in re.sub(r"[^a-z0-9]+", " ", val.lower()).split() if len(w) >= 3][:4]
-                key = "_".join(words) or "memory_note"
-            tags = [str(t).lower() for t in (op.get("tags") or []) if isinstance(t, str)]
-            if not tags and key:
-                tags = [w for w in key.split("_") if len(w) >= 3][:5]
-            tid = op.get("target_id")
+        with self.store.batch():
+            for op in ops:
+                if not isinstance(op, dict):
+                    continue
+                kind = str(op.get("op", "")).lower().strip()
+                cat = str(op.get("category", "project_state")).strip()
+                if cat not in CATEGORY_LIST:
+                    cat = "project_state"
+                key = str(op.get("key") or "").strip()
+                val = str(op.get("value") or op.get("content") or "").strip()
+                if not key and val:
+                    words = [w for w in re.sub(r"[^a-z0-9]+", " ", val.lower()).split() if len(w) >= 3][:4]
+                    key = "_".join(words) or "memory_note"
+                tags = [str(t).lower() for t in (op.get("tags") or []) if isinstance(t, str)]
+                if not tags and key:
+                    tags = [w for w in key.split("_") if len(w) >= 3][:5]
+                tid = op.get("target_id")
 
-            if kind == "add" and val:
-                nid = self.next_mem_id()
-                self.store.add(MemoryItem(nid, cat, key, val, tags, dict(write_meta)))
-                active_ids.add(nid)
-                applied.append(f"add:{nid}({key})")
-            elif kind == "update" and tid in active_ids and val:
-                nid = self.next_mem_id()
-                self.store.update(tid, MemoryItem(nid, cat, key, val, tags, dict(write_meta)))
-                active_ids.discard(tid)
-                active_ids.add(nid)
-                applied.append(f"upd:{tid}->{nid}({key})")
-            elif kind == "delete" and tid in active_ids:
-                self.store.delete(tid)
-                active_ids.discard(tid)
-                applied.append(f"del:{tid}")
+                if kind == "add" and val:
+                    nid = self.next_mem_id()
+                    self.store.add(MemoryItem(nid, cat, key, val, tags, dict(write_meta)))
+                    active_ids.add(nid)
+                    applied.append(f"add:{nid}({key})")
+                elif kind == "update" and tid in active_ids and val:
+                    nid = self.next_mem_id()
+                    self.store.update(tid, MemoryItem(nid, cat, key, val, tags, dict(write_meta)))
+                    active_ids.discard(tid)
+                    active_ids.add(nid)
+                    applied.append(f"upd:{tid}->{nid}({key})")
+                elif kind == "delete" and tid in active_ids:
+                    self.store.delete(tid)
+                    active_ids.discard(tid)
+                    applied.append(f"del:{tid}")
         LOG.info("Write-FOK [%s] committed %s in %.1f ms (active=%d)", source, applied, elapsed_ms, len(self.store.active_items(ctx)))
         return applied
 
@@ -318,7 +356,8 @@ def make_handler(state: FOKProxyState):
                     "status": "ok",
                     "public_model": state.public_model,
                     "upstream_model": state.upstream_model,
-                    "active_memories": len(state.store.active_items()),
+                    "active_memories": len(state.store.all_active_unfiltered()),
+                    "pending_writes": state._pending_writes,
                     "store_path": str(state.store_path),
                 })
                 return
@@ -335,23 +374,65 @@ def make_handler(state: FOKProxyState):
                 })
                 return
             if parsed.path == "/fok/memories":
+                state.wait_for_pending_writes()
                 qs = parse_qs(parsed.query)
-                scope = qs.get("scope", [None])[0]
-                ctx = {"allowed_scopes": [scope, "global"]} if scope else None
+                if qs.get("all", ["0"])[0] == "1":
+                    mems = [
+                        {"id": it.item_id, "version": it.version, "category": it.category, "key": it.key, "value": it.value, "scope": it.metadata.get("scope", "default")}
+                        for it in state.store.all_active_unfiltered()
+                    ]
+                    self._send_json(200, {"memories": mems})
+                    return
+                scope = qs.get("scope", [None])[0] or self.headers.get("X-FOK-Scope")
+                tenant = qs.get("tenant", [None])[0] or self.headers.get("X-FOK-Tenant")
+                if not scope and not tenant:
+                    # Trusted-local default: list all active memories only when explicitly queried with ?all=1 or scope
+                    mems = [
+                        {"id": it.item_id, "version": it.version, "category": it.category, "key": it.key, "value": it.value, "scope": it.metadata.get("scope", "default")}
+                        for it in state.store.all_active_unfiltered()
+                    ]
+                    self._send_json(200, {"memories": mems})
+                    return
+                ctx = {"allowed_scopes": [scope, "global"]} if scope else {}
+                if tenant:
+                    ctx["tenant_id"] = tenant
                 self._send_json(200, {"memories": state.store.dump_all_active(ctx)})
                 return
             self._send_json(404, {"error": "not_found"})
 
         def do_DELETE(self) -> None:
             parsed = urlparse(self.path)
+            state.wait_for_pending_writes()
             if parsed.path == "/fok/memories":
+                qs = parse_qs(parsed.query)
+                scope = qs.get("scope", [None])[0] or self.headers.get("X-FOK-Scope")
+                tenant = qs.get("tenant", [None])[0] or self.headers.get("X-FOK-Tenant")
                 with state.write_lock:
-                    state.store.clear_all()
-                self._send_json(200, {"cleared": True})
+                    if scope or tenant:
+                        ctx = {"allowed_scopes": [scope]} if scope else {}
+                        if tenant:
+                            ctx["tenant_id"] = tenant
+                        with state.store.batch():
+                            for it in list(state.store.active_items(ctx)):
+                                state.store.delete(it.item_id)
+                        self._send_json(200, {"cleared": True, "scope": scope, "tenant": tenant})
+                    else:
+                        state.store.clear_all()
+                        self._send_json(200, {"cleared": True})
                 return
             if parsed.path.startswith("/fok/memories/"):
                 mid = parsed.path.rsplit("/", 1)[-1]
+                scope = self.headers.get("X-FOK-Scope")
+                tenant = self.headers.get("X-FOK-Tenant")
                 with state.write_lock:
+                    if scope or tenant:
+                        ctx = {"allowed_scopes": [scope, "global"]} if scope else {}
+                        if tenant:
+                            ctx["tenant_id"] = tenant
+                        visible = {it.item_id for it in state.store.active_items(ctx)}
+                        if mid not in visible:
+                            self._send_json(403, {"error": f"memory {mid} not accessible in caller scope"})
+                            return
                     try:
                         state.store.delete(mid)
                     except KeyError:
@@ -444,7 +525,8 @@ def make_handler(state: FOKProxyState):
             messages = req_body.get("messages") or []
             ctx, write_meta = self._ctx_from_headers()
 
-            # Wait for any in-flight background write commit from the previous turn!
+            # Guarantee previous-write -> next-read ordering before checking active memories!
+            state.wait_for_pending_writes()
             with state.write_lock:
                 has_mem = state.store.has_active_memories(ctx)
 
@@ -545,118 +627,126 @@ def make_handler(state: FOKProxyState):
                     "Acknowledge concisely without claiming you lack persistent memory.\n"
                 )
 
+            # Register pending write BEFORE streaming the reply so any immediate follow-up turn waits for commit!
+            if did_write:
+                state.begin_pending_write()
+
             inline_buf = ""
-            with state.open_upstream(replay_payload) as resp2:
-                if want_stream:
-                    if not did_write:
-                        self._stream_passthrough(resp2)
-                    else:
-                        # Stream while capturing & stripping `<memory_op>...</memory_op>` from reasoning or content
-                        self.send_response(200)
-                        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                        self.send_header("Cache-Control", "no-cache")
-                        self.send_header("Connection", "close")
-                        self.end_headers()
-                        in_mem_op = {"reasoning_content": False, "content": False}
-                        pending_tag = {"reasoning_content": "", "content": ""}
-                        try:
-                            for raw_line in resp2:
-                                s = raw_line.decode("utf-8", "ignore").strip()
-                                if not s.startswith("data:") or s[5:].strip() == "[DONE]":
-                                    self.wfile.write(raw_line)
-                                    self.wfile.flush()
-                                    continue
-                                obj = json.loads(s[5:].strip())
-                                ch = (obj.get("choices") or [None])[0]
-                                d = (ch.get("delta") or {}) if ch else {}
-                                touched = False
-                                drop_chunk = False
-                                for fld in ("reasoning_content", "content"):
-                                    txt = d.get(fld)
-                                    if not txt:
+            write_dispatched = False
+            try:
+                with state.open_upstream(replay_payload) as resp2:
+                    if want_stream:
+                        if not did_write:
+                            self._stream_passthrough(resp2)
+                        else:
+                            # Stream while capturing & stripping `<memory_op>...</memory_op>` from reasoning or content
+                            self.send_response(200)
+                            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                            self.send_header("Cache-Control", "no-cache")
+                            self.send_header("Connection", "close")
+                            self.end_headers()
+                            in_mem_op = {"reasoning_content": False, "content": False}
+                            pending_tag = {"reasoning_content": "", "content": ""}
+                            try:
+                                for raw_line in resp2:
+                                    s = raw_line.decode("utf-8", "ignore").strip()
+                                    if not s.startswith("data:") or s[5:].strip() == "[DONE]":
+                                        self.wfile.write(raw_line)
+                                        self.wfile.flush()
                                         continue
-                                    touched = True
-                                    inline_buf += txt
-                                    if in_mem_op[fld]:
-                                        end_pos = txt.find("</memory_op>")
-                                        if end_pos >= 0:
-                                            in_mem_op[fld] = False
-                                            rem = txt[end_pos + len("</memory_op>"):]
-                                            if rem:
-                                                d[fld] = rem
+                                    obj = json.loads(s[5:].strip())
+                                    ch = (obj.get("choices") or [None])[0]
+                                    d = (ch.get("delta") or {}) if ch else {}
+                                    touched = False
+                                    drop_chunk = False
+                                    for fld in ("reasoning_content", "content"):
+                                        txt = d.get(fld)
+                                        if not txt:
+                                            continue
+                                        touched = True
+                                        inline_buf += txt
+                                        if in_mem_op[fld]:
+                                            end_pos = txt.find("</memory_op>")
+                                            if end_pos >= 0:
+                                                in_mem_op[fld] = False
+                                                rem = txt[end_pos + len("</memory_op>"):]
+                                                if rem:
+                                                    d[fld] = rem
+                                                else:
+                                                    d.pop(fld, None)
+                                                    drop_chunk = True
                                             else:
                                                 d.pop(fld, None)
                                                 drop_chunk = True
+                                            continue
+                                        combined = pending_tag[fld] + txt
+                                        pending_tag[fld] = ""
+                                        tag_pos = combined.find("<memory_op>")
+                                        if tag_pos >= 0:
+                                            before = combined[:tag_pos]
+                                            after = combined[tag_pos + len("<memory_op>"):]
+                                            end_pos = after.find("</memory_op>")
+                                            if end_pos >= 0:
+                                                emit = (before + after[end_pos + len("</memory_op>"):]).rstrip("\n")
+                                            else:
+                                                in_mem_op[fld] = True
+                                                emit = before.rstrip("\n")
+                                            if emit:
+                                                d[fld] = emit
+                                            else:
+                                                d.pop(fld, None)
+                                                drop_chunk = True
+                                            continue
+                                        hold = 0
+                                        for k in range(1, min(len("<memory_op>"), len(combined)) + 1):
+                                            if "<memory_op>".startswith(combined[-k:]):
+                                                hold = k
+                                        if hold:
+                                            pending_tag[fld] = combined[-hold:]
+                                            emit = combined[:-hold]
                                         else:
-                                            d.pop(fld, None)
-                                            drop_chunk = True
-                                        continue
-                                    combined = pending_tag[fld] + txt
-                                    pending_tag[fld] = ""
-                                    tag_pos = combined.find("<memory_op>")
-                                    if tag_pos >= 0:
-                                        before = combined[:tag_pos]
-                                        after = combined[tag_pos + len("<memory_op>"):]
-                                        end_pos = after.find("</memory_op>")
-                                        if end_pos >= 0:
-                                            emit = (before + after[end_pos + len("</memory_op>"):]).rstrip("\n")
-                                        else:
-                                            in_mem_op[fld] = True
-                                            emit = before.rstrip("\n")
+                                            emit = combined
                                         if emit:
                                             d[fld] = emit
                                         else:
                                             d.pop(fld, None)
                                             drop_chunk = True
-                                        continue
-                                    hold = 0
-                                    for k in range(1, min(len("<memory_op>"), len(combined)) + 1):
-                                        if "<memory_op>".startswith(combined[-k:]):
-                                            hold = k
-                                    if hold:
-                                        pending_tag[fld] = combined[-hold:]
-                                        emit = combined[:-hold]
-                                    else:
-                                        emit = combined
-                                    if emit:
-                                        d[fld] = emit
-                                    else:
-                                        d.pop(fld, None)
-                                        drop_chunk = True
-                                if not touched:
-                                    self.wfile.write(raw_line)
-                                    self.wfile.flush()
-                                elif not drop_chunk or d:
-                                    self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode("utf-8"))
-                                    self.wfile.flush()
-                        except BrokenPipeError:
-                            pass
-                else:
-                    out_obj = self._collect_non_stream(resp2)
-                    msg = (out_obj.get("choices") or [{}])[0].get("message") or {}
-                    inline_buf = (msg.get("reasoning_content") or "") + "\n" + (msg.get("content") or "")
-                    if did_write:
-                        for fld in ("reasoning_content", "content"):
-                            if msg.get(fld) and "<memory_op>" in msg[fld]:
-                                msg[fld] = re.sub(r"\s*<memory_op>.*?</memory_op>\s*", "", msg[fld], flags=re.DOTALL).strip()
-                    self._send_json(200, out_obj)
+                                    if not touched:
+                                        self.wfile.write(raw_line)
+                                        self.wfile.flush()
+                                    elif not drop_chunk or d:
+                                        self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode("utf-8"))
+                                        self.wfile.flush()
+                            except BrokenPipeError:
+                                pass
+                    else:
+                        out_obj = self._collect_non_stream(resp2)
+                        msg = (out_obj.get("choices") or [{}])[0].get("message") or {}
+                        inline_buf = (msg.get("reasoning_content") or "") + "\n" + (msg.get("content") or "")
+                        if did_write:
+                            for fld in ("reasoning_content", "content"):
+                                if msg.get(fld) and "<memory_op>" in msg[fld]:
+                                    msg[fld] = re.sub(r"\s*<memory_op>.*?</memory_op>\s*", "", msg[fld], flags=re.DOTALL).strip()
+                        self._send_json(200, out_obj)
 
-            # Inline `<memory_op>` fast commit (<5 ms!) with automatic fallback to background extractor
-            if did_write:
-                m_op = re.search(r"<memory_op>(.*?)</memory_op>", inline_buf, flags=re.DOTALL)
-                if m_op:
-                    t_in = time.perf_counter()
-                    ops = parse_ops_resilient(m_op.group(1))
-                    if ops:
-                        with state.write_lock:
-                            state.commit_ops(ops, ctx, write_meta, source="inline_adapter", elapsed_ms=(time.perf_counter() - t_in) * 1000)
-                        return
-                write_ctx = build_write_context(norm_msgs)
-                threading.Thread(
-                    target=state.run_write_extractor,
-                    args=(write_ctx, ctx, write_meta),
-                    daemon=True,
-                ).start()
+                # Inline `<memory_op>` fast commit (<5 ms!) with automatic fallback to non-daemon extractor
+                if did_write:
+                    m_op = re.search(r"<memory_op>(.*?)</memory_op>", inline_buf, flags=re.DOTALL)
+                    if m_op:
+                        t_in = time.perf_counter()
+                        ops = parse_ops_resilient(m_op.group(1))
+                        if ops:
+                            with state.write_lock:
+                                state.commit_ops(ops, ctx, write_meta, source="inline_adapter", elapsed_ms=(time.perf_counter() - t_in) * 1000)
+                            state.end_pending_write()
+                            write_dispatched = True
+                            return
+                    write_ctx = build_write_context(norm_msgs)
+                    state.start_background_extractor(write_ctx, ctx, write_meta)
+                    write_dispatched = True
+            finally:
+                if did_write and not write_dispatched:
+                    state.end_pending_write()
 
     return Handler
 
@@ -666,7 +756,7 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8190)
     ap.add_argument("--upstream", default="http://127.0.0.1:8189")
-    ap.add_argument("--model", default="inkling-stage-d2", help="Upstream Loom model id")
+    ap.add_argument("--model", default="inkling-stage-e", help="Upstream Loom model id")
     ap.add_argument("--public-model", default="inkling-fok-memory", help="Public OpenAI model id")
     ap.add_argument("--store", default=str(Path.home() / ".local/share/looped-fok/memories.json"))
     ap.add_argument("--reader", choices=["mlp", "lin"], default="mlp")
@@ -676,9 +766,22 @@ def main() -> None:
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s [%(levelname)s] %(message)s")
     state = FOKProxyState(args.upstream, args.model, args.public_model, args.store, reader=args.reader)
     srv = ThreadingHTTPServer((args.host, args.port), make_handler(state))
+
+    def _graceful_stop(signum, _frame) -> None:
+        LOG.info("Received signal %d — shutting down HTTP server and draining pending writes...", signum)
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGINT, _graceful_stop)
+    signal.signal(signal.SIGTERM, _graceful_stop)
+
     LOG.info("Looped FOK proxy listening on http://%s:%d -> %s (model=%s, store=%s, active=%d)",
-             args.host, args.port, args.upstream, args.model, args.store, len(state.store.active_items()))
-    srv.serve_forever()
+             args.host, args.port, args.upstream, args.model, args.store, len(state.store.all_active_unfiltered()))
+    try:
+        srv.serve_forever()
+    finally:
+        state.drain_pending_writes()
+        srv.server_close()
+        LOG.info("Looped FOK proxy stopped cleanly.")
 
 
 if __name__ == "__main__":

@@ -13,11 +13,13 @@ Two-layer separation:
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 CATEGORY_LIST: list[str] = [
     "fact_constraint",
@@ -56,13 +58,19 @@ class PolicyFilter:
 
 
 class ScopePolicyFilter(PolicyFilter):
-    """Drop-in scope/privacy plugin: hard tenant & scope masking + owner-private override."""
+    """Drop-in scope/privacy plugin: fail-closed tenant & scope masking + owner-private override.
+
+    Fail-closed: when `context` is absent (None or empty), returns NO items so scoped/private
+    records can never leak through an unconfigured caller.
+    """
 
     def filter_candidates(self, items: list[MemoryItem], context: dict | None = None) -> list[MemoryItem]:
         if not context:
-            return items
+            return []
         allowed_scopes = set(context.get("allowed_scopes", []))
         tenant = context.get("tenant_id")
+        if tenant is None and not allowed_scopes:
+            return []
         out = []
         for it in items:
             if tenant is not None and it.metadata.get("tenant_id") != tenant:
@@ -87,8 +95,27 @@ class GeneralMemoryStore:
         self._items: dict[str, MemoryItem] = {}
         self._policy = policy or PolicyFilter()
         self._persist_path = Path(persist_path) if persist_path else None
+        self._in_batch = False
         if self._persist_path and self._persist_path.exists():
             self.load_json(self._persist_path)
+
+    @contextlib.contextmanager
+    def batch(self) -> Iterator[None]:
+        """Atomic multi-operation batch: rolls back in-memory state on error, persists once on exit."""
+        snapshot = copy.deepcopy(self._items)
+        self._in_batch = True
+        try:
+            yield
+        except Exception:
+            self._items = snapshot
+            raise
+        finally:
+            self._in_batch = False
+        self.save_json()
+
+    def _maybe_save(self) -> None:
+        if not self._in_batch:
+            self.save_json()
 
     def save_json(self, path: str | Path | None = None) -> None:
         target = Path(path) if path else self._persist_path
@@ -109,14 +136,14 @@ class GeneralMemoryStore:
 
     def clear_all(self) -> None:
         self._items.clear()
-        self.save_json()
+        self._maybe_save()
 
     def add(self, item: MemoryItem) -> None:
         self._items[item.item_id] = copy.deepcopy(item)
-        self.save_json()
+        self._maybe_save()
 
     def update(self, old_id: str, new_item: MemoryItem) -> None:
-        """O(1) versioned update: supersedes old_id and activates new_item."""
+        """O(1) in-memory versioned update: supersedes old_id and activates new_item."""
         if old_id not in self._items:
             raise KeyError(f"Unknown item_id {old_id}")
         old = self._items[old_id]
@@ -126,14 +153,18 @@ class GeneralMemoryStore:
         ni.supersedes = old_id
         ni.status = "active"
         self._items[ni.item_id] = ni
-        self.save_json()
+        self._maybe_save()
 
     def delete(self, item_id: str) -> None:
-        """O(1) exact tombstone delete."""
+        """O(1) in-memory exact tombstone delete."""
         if item_id not in self._items:
             raise KeyError(f"Unknown item_id {item_id}")
         self._items[item_id].status = "deleted"
-        self.save_json()
+        self._maybe_save()
+
+    def all_active_unfiltered(self) -> list[MemoryItem]:
+        """Return all active items across scopes (trusted-local admin inspection only)."""
+        return [it for it in self._items.values() if it.status == "active"]
 
     def active_items(self, context: dict | None = None) -> list[MemoryItem]:
         raw = [it for it in self._items.values() if it.status == "active"]
