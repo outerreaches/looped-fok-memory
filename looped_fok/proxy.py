@@ -20,6 +20,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import logging
 import re
@@ -152,7 +153,15 @@ def parse_ops_resilient(raw: str) -> list[dict]:
             return [x for x in parsed if isinstance(x, dict)]
     except Exception:
         pass
-    # Fallback: recover any valid JSON objects inside the output individually
+    # Fallback 1: Python-style single-quoted JSON strings (e.g. "value":'...')
+    try:
+        py_cand = re.sub(r"\bnull\b", "None", re.sub(r"\btrue\b", "True", re.sub(r"\bfalse\b", "False", candidate)))
+        parsed = ast.literal_eval(py_cand)
+        if isinstance(parsed, list):
+            return [x for x in parsed if isinstance(x, dict)]
+    except Exception:
+        pass
+    # Fallback 2: recover any valid JSON objects inside the output individually
     dec = json.JSONDecoder()
     ops: list[dict] = []
     idx = 0
@@ -220,8 +229,9 @@ class FOKProxyState:
                     max_num = max(max_num, int(m.group(1)))
 
         is_lin = 1 if reader == "lin" else 0
-        self.ctrl_rw = pack_ctrl(alpha, vec_id=1, gate_mode=1, scope=9, reader_slot=0, is_lin=is_lin)
-        self.ctrl_write_only = pack_ctrl(0.0, vec_id=1, gate_mode=7, scope=9, reader_slot=0, is_lin=is_lin)
+        # scope=6 (both_passes + is_prefill_last): 1-token span_last steering -> KV prefix-cache invariant!
+        self.ctrl_rw = pack_ctrl(alpha, vec_id=1, gate_mode=1, scope=6, reader_slot=0, is_lin=is_lin)
+        self.ctrl_write_only = pack_ctrl(0.0, vec_id=1, gate_mode=7, scope=6, reader_slot=0, is_lin=is_lin)
         self.ctrl_adapter = pack_adapter_ctrl(1.0)
         self.write_lock = threading.Lock()
         self._pending_cond = threading.Condition()
@@ -289,7 +299,7 @@ class FOKProxyState:
             prompt = (
                 f"Currently active memories:\n{json.dumps(active_dump, indent=2)}\n\n"
                 f"{write_context}\n\n"
-                "Rules: emit at most 4 concise, 1-sentence operations; avoid raw double quotes inside values (use single quotes or backticks). "
+                "Rules: emit at most 4 concise, 1-sentence operations; output STRICT valid JSON using double quotes for all keys and string delimiters (use backticks inside text values instead of quotes). "
                 "If the latest user message states durable facts OR asks to remember/update/delete facts from the "
                 "immediately preceding assistant summary, output ONLY the valid JSON array of memory operations:"
             )

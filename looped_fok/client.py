@@ -86,8 +86,9 @@ class UnifiedFOKClient:
         self.reasoning_effort = reasoning_effort
         self.max_tokens = max_tokens
         is_lin = 1 if reader == "lin" else 0
-        self.ctrl_rw = pack_ctrl(alpha, vec_id=1, gate_mode=1, scope=9, reader_slot=0, is_lin=is_lin)
-        self.ctrl_write_only = pack_ctrl(0.0, vec_id=1, gate_mode=7, scope=9, reader_slot=0, is_lin=is_lin)
+        # scope=6 (both_passes + is_prefill_last): 1-token span_last steering -> KV prefix-cache invariant!
+        self.ctrl_rw = pack_ctrl(alpha, vec_id=1, gate_mode=1, scope=6, reader_slot=0, is_lin=is_lin)
+        self.ctrl_write_only = pack_ctrl(0.0, vec_id=1, gate_mode=7, scope=6, reader_slot=0, is_lin=is_lin)
         self._next_id = 1
 
     def _stream(self, payload: dict, stop_on_signal: bool = True) -> dict:
